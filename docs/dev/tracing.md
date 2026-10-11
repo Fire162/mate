@@ -5,6 +5,7 @@ audience: dev
 order: 80
 covers:
   - shared/utils/tracing/**
+  - server/proxy_routes.py
 ---
 
 # OpenTelemetry Distributed Tracing
@@ -19,27 +20,27 @@ MATE uses OpenTelemetry for distributed tracing of agent executions, LLM calls, 
 # Enable tracing (default: false)
 OTEL_TRACING_ENABLED=true
 
-# Optional: OTLP endpoint for Jaeger, Grafana Tempo, Datadog, Honeycomb
-# When unset, only DB export runs (for dashboard)
+# Optional: OTLP endpoint for Jaeger, Grafana Tempo, Datadog, Honeycomb (OTLP over HTTP)
+# There is no default: when unset, spans only go to the database
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 
-# Service name for traces
+# Service name for traces (only applies when MATE initializes its own TracerProvider)
 OTEL_SERVICE_NAME=mate
 
 # Store spans in database for dashboard viewer (default: true when tracing enabled)
 OTEL_TRACES_DB_EXPORT=true
 ```
 
-### Zero Performance Overhead When Disabled
+### Performance When Disabled
 
-When `OTEL_TRACING_ENABLED=false` (default), tracing is completely disabled. Tracers and wrappers short-circuit without creating spans, incurring zero runtime overhead.
+When `OTEL_TRACING_ENABLED=false` (default), tracing is disabled. Tool wrapping is skipped, but calls via `trace_context` still route through a no-op tracer.
 
-## Architecture and Exporters
+## Architecture & Tracer Providers
 
-- **TracerProvider integration**: When ADK has already set an SDK `TracerProvider`, MATE attaches its `BatchSpanProcessor(DatabaseSpanExporter())` directly to that provider. If no SDK provider exists, MATE creates an SDK `TracerProvider` with the configured resource name.
+- **TracerProvider integration**: When ADK has already initialized an SDK `TracerProvider`, MATE adds only its `BatchSpanProcessor(DatabaseSpanExporter())` to it and returns. In this case, MATE's OTLP exporter and `OTEL_SERVICE_NAME` configuration do not apply.
+- **Standalone TracerProvider**: When no SDK provider is found, MATE initializes its own `TracerProvider` with `service.name` set to `OTEL_SERVICE_NAME`.
 - **Database Span Exporter**: When `OTEL_TRACES_DB_EXPORT=true`, spans are batched (1-second flush delay) and persisted to the `trace_spans` table for visualization in the dashboard.
-- **OTLP Exporter**: When `OTEL_EXPORTER_OTLP_ENDPOINT` is configured, spans are exported via HTTP/protobuf or gRPC to OTLP collectors.
+- **OTLP Exporter**: When `OTEL_EXPORTER_OTLP_ENDPOINT` is explicitly set, spans are exported using OTLP over HTTP (`opentelemetry.exporter.otlp.proto.http`). gRPC is not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` is not read.
 
 ## Instrumentation
 
@@ -53,17 +54,15 @@ When `OTEL_TRACING_ENABLED=false` (default), tracing is completely disabled. Tra
 
 ## Dashboard
 
-The `/dashboard/traces` page shows traces from the `trace_spans` table when `OTEL_TRACES_DB_EXPORT=true`. Traces are grouped by trace ID with a call graph showing span hierarchy and latency.
+The `/dashboard/traces` page shows traces from the database when `OTEL_TRACES_DB_EXPORT=true`. Traces are grouped by trace ID with a call graph showing span hierarchy and latency.
 
 ## OTLP Export
 
 To export to Jaeger, Grafana Tempo, Datadog, or Honeycomb:
 
 1. Run an OTLP-compatible collector (e.g. Jaeger all-in-one, Grafana OTLP collector).
-2. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to the collector URL (default: `http://localhost:4318`).
-3. Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` (or `grpc`).
+2. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to the collector's OTLP HTTP URL (for example `http://localhost:4318`). There is no default: without this variable, spans only go to the database. Only OTLP over HTTP is supported (`opentelemetry.exporter.otlp.proto.http`). gRPC is not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` is ignored.
 
 ## W3C Trace Context
 
-Trace context is propagated via standard `traceparent` and `tracestate` headers. Inbound and proxy requests preserve and inject trace context when tracing is enabled.
-
+Trace context is injected by the auth server proxy (`_inject_trace_headers` in `server/proxy_routes.py`) when forwarding requests to ADK if tracing is enabled. Nothing extracts trace context from inbound external requests.
