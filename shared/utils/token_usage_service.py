@@ -52,6 +52,17 @@ class TokenUsageService:
         try:
             # Generate request_id if not provided
             request_id = token_data.get('request_id') or str(uuid.uuid4())
+            status = token_data.get('status', 'SUCCESS')
+            cost = None
+            if status == 'SUCCESS':
+                # Priced now, at the price of the day; None when the model has none
+                from .model_pricing import cost_usd
+                try:
+                    cost = cost_usd(token_data.get('model_name'), token_data.get('prompt_tokens'),
+                                    token_data.get('response_tokens'), token_data.get('thoughts_tokens'),
+                                    token_data.get('tool_use_tokens'))
+                except Exception as e:
+                    logger.warning(f"Could not price the call: {e}")
             
             # Create TokenUsageLog instance
             token_log = TokenUsageLog(
@@ -64,8 +75,10 @@ class TokenUsageService:
                 response_tokens=token_data.get('response_tokens'),
                 thoughts_tokens=token_data.get('thoughts_tokens'),
                 tool_use_tokens=token_data.get('tool_use_tokens'),
-                status=token_data.get('status', 'SUCCESS'),
-                error_description=token_data.get('error_description')
+                status=status,
+                error_description=token_data.get('error_description'),
+                cost_usd=cost,
+                is_fallback=bool(token_data.get('is_fallback')),
             )
             
             session.add(token_log)
@@ -260,7 +273,8 @@ class TokenUsageService:
                        response_tokens: Optional[int] = None, thoughts_tokens: Optional[int] = None,
                        tool_use_tokens: Optional[int] = None, status: str = 'SUCCESS',
                        error_description: Optional[str] = None, 
-                       timestamp: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+                       timestamp: Optional[datetime] = None,
+                       is_fallback: bool = False) -> Optional[Dict[str, Any]]:
         """
         Convenience method to log token usage with all parameters.
         
@@ -277,6 +291,7 @@ class TokenUsageService:
             status: Request status (SUCCESS, ERROR, ACCESS_DENIED, etc.)
             error_description: Description of error if status is not SUCCESS
             timestamp: Timestamp of the request (optional, defaults to now)
+            is_fallback: Whether the agent's fallback model answered
             
         Returns:
             Inserted record or None if failed
@@ -292,7 +307,8 @@ class TokenUsageService:
             'thoughts_tokens': thoughts_tokens,
             'tool_use_tokens': tool_use_tokens,
             'status': status,
-            'error_description': error_description
+            'error_description': error_description,
+            'is_fallback': is_fallback,
         }
         
         if timestamp:
@@ -371,6 +387,41 @@ class TokenUsageService:
         except SQLAlchemyError as e:
             logger.error("Failed to get project tokens since: %s", e)
             return 0
+        finally:
+            session.close()
+
+    def get_cost_since(self, scope: str, scope_id: str, since: datetime) -> float:
+        """US dollars a user, agent or project spent since the given datetime.
+
+        Only calls whose model has a price have a cost; the rest add nothing.
+        """
+        session = self._get_session()
+        if not session:
+            return 0.0
+        try:
+            query = session.query(func.coalesce(func.sum(TokenUsageLog.cost_usd), 0.0)).filter(
+                TokenUsageLog.timestamp >= since)
+            if scope == "user":
+                query = query.filter(TokenUsageLog.user_id == scope_id)
+            elif scope == "agent":
+                query = query.filter(TokenUsageLog.agent_name == scope_id)
+            elif scope == "project":
+                from .models import AgentConfig
+                try:
+                    project_id = int(scope_id)
+                except (TypeError, ValueError):
+                    return 0.0
+                agent_names = [r[0] for r in session.query(AgentConfig.name).filter(
+                    AgentConfig.project_id == project_id).all()]
+                if not agent_names:
+                    return 0.0
+                query = query.filter(TokenUsageLog.agent_name.in_(agent_names))
+            else:
+                return 0.0
+            return float(query.scalar() or 0.0)
+        except SQLAlchemyError as e:
+            logger.error("Failed to get cost since: %s", e)
+            return 0.0
         finally:
             session.close()
 

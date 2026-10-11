@@ -54,7 +54,7 @@ Things to adjust in `docker-compose.yml` before relying on it:
 - `DB_TYPE` and `ARTIFACT_SERVICE` come from `.env` and default to `sqlite` and
   `local_folder`, which is what the mounted `./data` and `./artifacts` volumes serve.
   To use PostgreSQL or Supabase, set them in `.env` along with their connection
-  settings. `DB_HOST` defaults to `localhost`, which inside the container is the
+  settings; [Artifact storage](artifact-storage.md) covers each artifact backend. `DB_HOST` defaults to `localhost`, which inside the container is the
   container itself, so point it at your database host.
 - It requires `AUTH_PASSWORD` to be set and refuses to start otherwise. `DB_PASSWORD`
   is optional and only matters for PostgreSQL or MySQL.
@@ -76,7 +76,7 @@ session cookie to HTTPS only.
 | `OAUTH_ALLOWED_DOMAINS` or `OAUTH_ALLOWED_EMAILS` | With single sign-on enabled and neither set, anyone with a Google or GitHub account can create a session. |
 | `RATE_LIMIT_ENABLED=true` | Limits and budgets are not applied otherwise. |
 | `WIDGET_ORIGIN_STRICT=true` | A widget key's allowed origins are only logged otherwise. |
-| `CSP_MODE=enforce` | The Content-Security-Policy is report-only by default. Watch the reports first, then enforce. |
+| `CSP_MODE=enforce` | The Content-Security-Policy is report-only by default. Watch the reports first, then enforce. Under `enforce`, an inline script runs only with the response's nonce and no inline handler runs; see [Content-Security-Policy](content-security-policy.md). |
 | `ALERTS_ENABLED=true` | Alert rules are not evaluated otherwise. |
 | `AUDIT_RETENTION_DAYS` | Entries are kept forever by default. |
 
@@ -129,3 +129,6 @@ What carries over and what does not:
   that command installed on every machine that runs the build.
 - There is no authentication. Anyone who can reach the port can use the agent, so it
   listens on `127.0.0.1` by default (`STANDALONE_HOST`, `STANDALONE_PORT`).
+- 👍/👎 ratings are shown only when the build can send them to a central MATE
+  (`MATE_FEEDBACK_URL`, `MATE_FEEDBACK_KEY`); see
+  [Standalone build](standalone-build.md#response-ratings).
