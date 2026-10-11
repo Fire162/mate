@@ -298,6 +298,13 @@ class DashboardServer:
                 'database_info': self._get_database_info()
             }
             result.update(self._get_quality_stats(session, start_date, end_date, origins))
+            try:
+                result['cost'] = self._get_cost_stats(session, start_date, end_date)
+            except Exception as e:
+                # Like the quality panels: a failure here must not blank the page
+                logger.warning(f"Cost stats failed: {e}")
+                session.rollback()
+                result['cost'] = None
             return result
         except Exception as e:
             print(f"Error getting usage stats: {e}")
@@ -432,6 +439,67 @@ class DashboardServer:
         """
         return cls.ORIGIN_FILTERS.get((origin or '').strip().lower(),
                                       cls.INTERACTIVE_ORIGINS)
+
+    def _get_cost_stats(self, session, start_date, end_date) -> Dict[str, Any]:
+        """What the period's successful calls cost in US dollars, by agent and project.
+
+        A call whose model has no known price has no cost (NULL), so totals cover
+        priced calls only; the share of tokens without a price says how much of the
+        traffic the totals leave out. See shared/utils/model_pricing.py.
+        """
+        from sqlalchemy import case, func
+
+        log = self.TokenUsageLog
+        tokens = func.coalesce(log.prompt_tokens, 0) + func.coalesce(log.response_tokens, 0)
+        unpriced = log.cost_usd.is_(None)
+        in_period = (log.status == 'SUCCESS', log.timestamp >= start_date, log.timestamp <= end_date)
+
+        totals = session.query(
+            func.sum(log.cost_usd),
+            func.sum(case((log.is_fallback.is_(True), log.cost_usd), else_=0)),
+            func.sum(case((log.is_fallback.is_(True), 1), else_=0)),
+            func.sum(case((unpriced, 1), else_=0)),
+            func.sum(case((unpriced, tokens), else_=0)),
+            func.sum(tokens),
+        ).filter(*in_period).one()
+        total_tokens = int(totals[5] or 0)
+
+        by_agent = session.query(
+            log.agent_name,
+            func.count(log.id),
+            func.sum(log.cost_usd),
+            func.sum(case((unpriced, 1), else_=0)),
+            func.sum(case((log.is_fallback.is_(True), log.cost_usd), else_=0)),
+        ).filter(*in_period).group_by(log.agent_name).all()
+
+        agent_rows = []
+        project_totals: Dict[Any, Dict[str, Any]] = {}
+        names = [row[0] for row in by_agent if row[0]]
+        project_of = dict(session.query(self.AgentConfig.name, self.AgentConfig.project_id)
+                          .filter(self.AgentConfig.name.in_(names)).all()) if names else {}
+        project_names = dict(session.query(self.Project.id, self.Project.name).all())
+        for agent, calls, cost, unpriced_calls, fallback_cost in by_agent:
+            row = {"agent": agent or "unknown", "calls": int(calls or 0), "cost_usd": float(cost or 0),
+                   "unpriced_calls": int(unpriced_calls or 0), "fallback_cost_usd": float(fallback_cost or 0)}
+            agent_rows.append(row)
+            project_id = project_of.get(agent)
+            project = project_totals.setdefault(project_id, {
+                "project": project_names.get(project_id, "No project"),
+                "calls": 0, "cost_usd": 0.0, "unpriced_calls": 0})
+            project["calls"] += row["calls"]
+            project["cost_usd"] += row["cost_usd"]
+            project["unpriced_calls"] += row["unpriced_calls"]
+
+        by_cost = lambda r: (-r["cost_usd"], -r["calls"])  # noqa: E731
+        return {
+            "total_usd": float(totals[0] or 0),
+            "fallback_usd": float(totals[1] or 0),
+            "fallback_calls": int(totals[2] or 0),
+            "unpriced_calls": int(totals[3] or 0),
+            "unpriced_tokens_pct": round(100 * int(totals[4] or 0) / total_tokens, 1) if total_tokens else 0.0,
+            "by_agent": sorted(agent_rows, key=by_cost),
+            "by_project": sorted(project_totals.values(), key=by_cost),
+        }
 
     def _get_quality_stats(self, session, start_date, end_date,
                            origins: Optional[tuple] = None) -> Dict[str, Any]:
@@ -574,28 +642,8 @@ class DashboardServer:
 
     def _get_database_info(self) -> dict:
         """Get database connection information."""
-        db_type = os.getenv("DB_TYPE", "sqlite").upper()
-        info = {
-            "type": db_type,
-            "hostname": None,
-            "filename": None,
-            "database": None,
-            "port": None
-        }
-        
-        if db_type == "SQLITE":
-            db_path = os.getenv("DB_PATH", "my_agent_data.db")
-            info["filename"] = os.path.basename(db_path)
-        elif db_type == "POSTGRESQL":
-            info["hostname"] = os.getenv("DB_HOST", "localhost")
-            info["database"] = os.getenv("DB_NAME", "")
-            info["port"] = os.getenv("DB_PORT", "5432")
-        elif db_type == "MYSQL":
-            info["hostname"] = os.getenv("DB_HOST", "localhost")
-            info["database"] = os.getenv("DB_NAME", "")
-            info["port"] = os.getenv("DB_PORT", "3306")
-        
-        return info
+        from shared.utils import settings
+        return settings.database_info()
     
     def _get_all_users(self) -> List[Dict[str, Any]]:
         """Get all users from database."""
@@ -3734,6 +3782,8 @@ class DashboardServer:
                 "tokens_last_hour": usage.tokens_last_hour,
                 "tokens_last_day": usage.tokens_last_day,
                 "tokens_last_month": usage.tokens_last_month,
+                "usd_last_day": usage.usd_last_day,
+                "usd_last_month": usage.usd_last_month,
             }
 
         @self.app.post("/dashboard/api/rate-limits", tags=["Dashboard - Rate Limits"])
@@ -3750,6 +3800,17 @@ class DashboardServer:
                 raise HTTPException(status_code=400, detail="scope and scope_id required")
             if scope not in ("user", "agent", "project"):
                 raise HTTPException(status_code=400, detail="scope must be user, agent, or project")
+            import math
+            budgets = {}
+            for key in ("usd_per_day", "usd_per_month"):
+                value = body.get(key)
+                if value is None or value == "":
+                    budgets[key] = None
+                elif isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(value) or value < 0:
+                    raise HTTPException(status_code=400, detail=f"{key} must be a number of dollars, 0 or more")
+                else:
+                    budgets[key] = float(value)
             svc = get_rate_limit_service()
             result = svc.upsert_config(
                 scope=scope,
@@ -3759,6 +3820,8 @@ class DashboardServer:
                 tokens_per_day=body.get("tokens_per_day"),
                 tokens_per_month=body.get("tokens_per_month"),
                 max_tokens_per_request=body.get("max_tokens_per_request"),
+                usd_per_day=budgets["usd_per_day"],
+                usd_per_month=budgets["usd_per_month"],
                 action_on_limit=body.get("action_on_limit", "block"),
                 alert_thresholds=body.get("alert_thresholds", [80, 90, 100]),
                 alert_webhook_url=body.get("alert_webhook_url"),
@@ -6044,6 +6107,12 @@ class DashboardServer:
                     events_by_session[sid] = self._get_session_events(sid)
                 events = events_by_session[sid]
                 question, answer = extract_exchange(events or [], row["message_id"])
+                reported_question = row.pop("reported_question", None)
+                reported_answer = row.pop("reported_answer", None)
+                # A standalone build's session is not here; it sent the exchange instead
+                row["reported"] = not (question or answer) and bool(reported_question or reported_answer)
+                if row["reported"]:
+                    question, answer = reported_question, reported_answer
                 row["question"] = question
                 row["answer"] = answer
                 row["session_available"] = events is not None
@@ -6075,11 +6144,15 @@ class DashboardServer:
                 from shared.utils.agent_improver import blocks_read
                 events = self._get_session_events(fb.session_id) or []
                 question, answer = extract_exchange(events, fb.message_id)
+                reported = not question and bool(fb.question)
+                if reported:
+                    # Sent by a standalone build, whose session this server cannot read
+                    question, answer = fb.question, fb.answer
                 if not question:
                     raise HTTPException(status_code=400, detail="The rated conversation is no longer available")
                 return {"agent_name": fb.agent_name, "question": question, "answer": answer,
                         "expected": None, "comment": fb.comment, "source": {"feedback_id": fb.id},
-                        "blocks_read": blocks_read(events, fb.message_id)}
+                        "blocks_read": blocks_read(events, fb.message_id), "reported": reported}
             raise HTTPException(status_code=400, detail="test_case_id or feedback_id is required")
 
         def _agent_row(session, agent_name: str):
@@ -6189,6 +6262,7 @@ class DashboardServer:
                 raise HTTPException(status_code=400, detail=str(e))
             return {"agent_name": ctx["agent_name"], "source": ctx["source"],
                     "question": ctx["question"], "answer": ctx["answer"],
+                    "reported": ctx.get("reported", False),
                     "current_instruction": current, **proposal,
                     "candidate_blocks": [{"label": k, "value": v, "selected": k in selected}
                                          for k, v in candidates.items()],
@@ -6260,6 +6334,176 @@ class DashboardServer:
                           for tc in cases],
                 "before": _summary(before_results),
                 "after": _summary(after_results),
+            }
+
+        # ── Playground: the same prompts on 2-3 variants of an agent ──────────────
+
+        @self.app.get("/dashboard/api/evals/playground/agents", tags=["Dashboard - Evals"])
+        async def playground_agents(request: Request, username: str = Depends(self._get_auth_user_dependency)):
+            """Agents the Playground can run, with their model and how many active test cases they have."""
+            session = self.db_client.get_session() if self.db_client else None
+            if not session:
+                raise HTTPException(status_code=503, detail="Database not available")
+            try:
+                from sqlalchemy import func
+                counts = dict(session.query(self.TestCase.agent_name, func.count(self.TestCase.id))
+                              .filter(self.TestCase.is_active.is_(True))
+                              .group_by(self.TestCase.agent_name).all())
+                agents = session.query(self.AgentConfig.name, self.AgentConfig.model_name) \
+                    .filter(self.AgentConfig.type == "llm").order_by(self.AgentConfig.name).all()
+                return {"agents": [{"name": name, "model_name": model, "active_cases": counts.get(name, 0)}
+                                   for name, model in agents]}
+            finally:
+                session.close()
+
+        @self.app.get("/dashboard/api/evals/playground/agent/{agent_name}", tags=["Dashboard - Evals"])
+        async def playground_agent(agent_name: str, request: Request,
+                                   username: str = Depends(self._get_auth_user_dependency)):
+            """An agent's current model and instructions, and its stored versions, to start variants from."""
+            session = self.db_client.get_session() if self.db_client else None
+            if not session:
+                raise HTTPException(status_code=503, detail="Database not available")
+            try:
+                config = _agent_row(session, agent_name)
+                versions = (session.query(self.AgentConfigVersion)
+                            .filter(self.AgentConfigVersion.agent_config_id == config.id)
+                            .order_by(self.AgentConfigVersion.version_number.desc()).limit(50).all())
+                active = session.query(self.TestCase).filter(
+                    self.TestCase.agent_name == config.name, self.TestCase.is_active.is_(True)).count()
+                return {"name": config.name, "model_name": config.model_name,
+                        "instruction": config.instruction or "", "active_cases": active,
+                        "versions": [{"id": v.id, "version_number": v.version_number, "tag": v.tag,
+                                      "created_at": v.created_at.isoformat() if v.created_at else None}
+                                     for v in versions]}
+            finally:
+                session.close()
+
+        @self.app.post("/dashboard/api/evals/playground/run", tags=["Dashboard - Evals"])
+        async def playground_run(request: Request, username: str = Depends(self._get_auth_user_dependency),
+                                 body: Dict[str, Any] = Body(...)):
+            """
+            Run one prompt, or the agent's active eval suite, on 2-3 variants of the
+            agent and return replies, scores, latency and cost side by side. A variant
+            is the current config, or a stored version, with an optional other model
+            and other instructions. Nothing is saved or deployed.
+            """
+            import json as _json
+            from shared.utils.agent_improver import MAX_INSTRUCTION_CHARS
+            from shared.utils.eval_playground import (MAX_VARIANTS, MIN_VARIANTS, Case, Variant,
+                                                      add_costs, run_variant, summarize)
+            from shared.utils.eval_runner import EvalRunner
+
+            agent_name = body.get("agent_name")
+            mode = body.get("mode")
+            if mode not in ("prompt", "suite"):
+                raise HTTPException(status_code=400, detail="mode must be prompt or suite")
+            raw_variants = body.get("variants")
+            if not isinstance(raw_variants, list) or not MIN_VARIANTS <= len(raw_variants) <= MAX_VARIANTS:
+                raise HTTPException(status_code=400,
+                                    detail=f"Give {MIN_VARIANTS} to {MAX_VARIANTS} variants")
+
+            session = self.db_client.get_session() if self.db_client else None
+            if not session:
+                raise HTTPException(status_code=503, detail="Database not available")
+            try:
+                config = _agent_row(session, agent_name if isinstance(agent_name, str) else "")
+                current = self._build_config_snapshot(config)
+                variants = []
+                for i, raw in enumerate(raw_variants):
+                    if not isinstance(raw, dict):
+                        raise HTTPException(status_code=400, detail="Each variant must be an object")
+                    snapshot = dict(current)
+                    version_id = raw.get("version_id")
+                    if version_id not in (None, ""):
+                        version = session.get(self.AgentConfigVersion, version_id) \
+                            if isinstance(version_id, int) else None
+                        if version is None or version.agent_config_id != config.id:
+                            raise HTTPException(status_code=400, detail="The version is not one of this agent's")
+                        snapshot = dict(_json.loads(version.config_snapshot or "{}"), name=config.name)
+                    model = raw.get("model_name")
+                    if model not in (None, ""):
+                        if not isinstance(model, str) or len(model) > 255 or any(c.isspace() for c in model):
+                            raise HTTPException(status_code=400, detail="model_name must be a single model name")
+                        snapshot["model_name"] = model
+                    instruction = raw.get("instruction")
+                    if instruction not in (None, ""):
+                        if not isinstance(instruction, str) or len(instruction) > MAX_INSTRUCTION_CHARS:
+                            raise HTTPException(status_code=400, detail="instruction is too long")
+                        snapshot["instruction"] = instruction
+                    label = raw.get("label") if isinstance(raw.get("label"), str) and raw.get("label").strip() \
+                        else f"Variant {chr(65 + i)}"
+                    variants.append(Variant(label=label.strip()[:60], snapshot=snapshot))
+
+                if mode == "suite":
+                    rows = (session.query(self.TestCase)
+                            .filter(self.TestCase.agent_name == config.name, self.TestCase.is_active.is_(True))
+                            .order_by(self.TestCase.id).all())
+                    if not rows:
+                        raise HTTPException(status_code=400, detail="This agent has no active test cases")
+                    cases = [Case(id=r.id, input=r.input, expected_output=r.expected_output,
+                                  eval_method=r.eval_method, threshold=r.threshold, judge_model=r.judge_model)
+                             for r in rows]
+                else:
+                    prompt = body.get("prompt")
+                    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20000:
+                        raise HTTPException(status_code=400, detail="prompt is required, at most 20000 characters")
+                    expected = body.get("expected_output")
+                    method = body.get("eval_method") or "semantic"
+                    if method not in ("exact_match", "semantic", "llm_judge"):
+                        raise HTTPException(status_code=400, detail="eval_method must be exact_match, semantic or llm_judge")
+                    cases = [Case(input=prompt,
+                                  expected_output=expected.strip() if isinstance(expected, str) and expected.strip() else None,
+                                  eval_method=method)]
+            finally:
+                session.close()
+
+            import hashlib
+            from starlette.concurrency import run_in_threadpool
+            from shared.utils.audit_service import ACTION_PLAYGROUND_RUN, RESOURCE_AGENT, log
+
+            # Before the run, so a run that fails or never ends is recorded too.
+            # Changed instructions are recorded by length and hash, not as text.
+            audited = []
+            for variant, raw in zip(variants, raw_variants):
+                detail: Dict[str, Any] = {"label": variant.label,
+                                          "model_name": variant.snapshot.get("model_name"),
+                                          "version_id": raw.get("version_id") or None}
+                text = variant.snapshot.get("instruction") or ""
+                if text != (current.get("instruction") or ""):
+                    detail["instruction_changed"] = {
+                        "chars": len(text), "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]}
+                audited.append(detail)
+            await run_in_threadpool(log, username, ACTION_PLAYGROUND_RUN, RESOURCE_AGENT, config.name,
+                                    {"mode": mode, "cases": len(cases), "variants": audited}, request)
+
+            # Have OpenRouter's prices before the runs log their calls, so a variant on
+            # an openrouter model is not compared as unpriced
+            from shared.utils.model_pricing import OPENROUTER_PREFIX, price_for
+            for model in {v.snapshot.get("model_name") or "" for v in variants}:
+                if model.startswith(OPENROUTER_PREFIX):
+                    await run_in_threadpool(price_for, model, True)
+                    break
+
+            scorer = EvalRunner()
+            for variant in variants:
+                await run_variant(variant, cases, scorer)
+
+            session = self.db_client.get_session()
+            try:
+                add_costs(session, variants)
+            finally:
+                session.close()
+
+            return {
+                "agent_name": config.name,
+                "mode": mode,
+                "variants": [{"label": v.label, "model_name": v.snapshot.get("model_name"),
+                              "error": v.error, "summary": summarize(v)} for v in variants],
+                "cases": [{"id": c.id, "input": c.input, "expected_output": c.expected_output,
+                           "results": [{k: v for k, v in variant.results[i].items() if k != "invocation_ids"}
+                                       if i < len(variant.results) else None
+                                       for variant in variants]}
+                          for i, c in enumerate(cases)],
             }
 
         @self.app.post("/dashboard/api/evals/improve/apply", tags=["Dashboard - Evals"])
@@ -6703,6 +6947,23 @@ class DashboardServer:
                 "agents": [{"name": a.get("name", ""), "type": a.get("type", ""), "project_id": a.get("project_id"), "parent_agents": a.get("parent_agents") or []} for a in agents],
                 "is_admin": True,
             })
+
+        @self.app.get("/dashboard/workroom/canvas", response_class=HTMLResponse, include_in_schema=False,
+                      tags=["Dashboard - Pages"])
+        async def dashboard_workroom_canvas(username: str = Depends(self._get_auth_user_dependency)):
+            """An empty page that runs the code shown in the Work Room canvas.
+
+            The code arrives by postMessage from the Work Room (workroom-canvas-frame.js).
+            The page's own policy sandboxes it, see server.csp.canvas_policy.
+            The script is inline: Chrome refuses a sandboxed page's requests to a
+            loopback or private address, which is where MATE often runs.
+            """
+            from server.csp import CSP_HEADER, canvas_policy
+
+            script = (self.project_root / "static" / "js" / "workroom-canvas-frame.js").read_text(encoding="utf-8")
+            html = ('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>'
+                    f'<script>{script}</script></body></html>')
+            return HTMLResponse(html, headers={CSP_HEADER: canvas_policy()})
 
         @self.app.get("/dashboard/workroom", response_class=HTMLResponse, tags=["Dashboard - Pages"])
         async def dashboard_workroom(request: Request, agent: Optional[str] = None, session: Optional[str] = None, username: str = Depends(self._get_auth_user_dependency)):
@@ -7242,6 +7503,182 @@ class DashboardServer:
                 "is_admin": True,
             })
 
+        @self.app.get("/dashboard/settings", response_class=HTMLResponse, tags=["Dashboard - Pages"])
+        async def dashboard_settings(request: Request, username: str = Depends(self._get_auth_user_dependency)):
+            if not self._get_is_admin(request):
+                return RedirectResponse(url="/dashboard/workroom", status_code=302)
+            return self.templates.TemplateResponse(request, "dashboard/settings.html", {
+                "request": request,
+                "page_title": "Settings",
+                "username": username,
+                "is_admin": True,
+            })
+
+        def _image_model_state() -> Dict[str, Any]:
+            from shared.utils.system_settings import IMAGE_MODEL, get_setting
+            from shared.utils.tools.image_tools import (
+                DEFAULT_IMAGE_MODEL, default_image_model, validate_image_generation_setup)
+            effective, source = default_image_model()
+            ok, error, details = validate_image_generation_setup()
+            return {"stored": get_setting(IMAGE_MODEL) or "",
+                    "env": (os.getenv("IMAGE_MODEL") or "").strip(),
+                    "builtin": DEFAULT_IMAGE_MODEL,
+                    "effective": effective, "source": source,
+                    "check": {"ok": ok, "error": error or None,
+                              "provider": details.get("provider"),
+                              "missing_keys": details.get("missing_keys") or []}}
+
+        @self.app.get("/dashboard/api/settings/image-model", tags=["Dashboard - Settings"])
+        async def get_image_model_setting(request: Request, username: str = Depends(self._get_auth_user_dependency)):
+            """The default image model for agents that name none, where it comes from, and whether its key is set."""
+            if not self._get_is_admin(request):
+                raise HTTPException(status_code=403, detail="Forbidden")
+            return _image_model_state()
+
+        @self.app.put("/dashboard/api/settings/image-model", tags=["Dashboard - Settings"])
+        async def put_image_model_setting(request: Request, username: str = Depends(self._get_auth_user_dependency),
+                                          body: Dict[str, Any] = Body(...)):
+            """Set the default image model; an empty model falls back to IMAGE_MODEL, then dall-e-3."""
+            if not self._get_is_admin(request):
+                raise HTTPException(status_code=403, detail="Forbidden")
+            from shared.utils.system_settings import IMAGE_MODEL, get_setting, set_setting
+            model = body.get("model")
+            if model is not None and not isinstance(model, str):
+                raise HTTPException(status_code=400, detail="model must be a string")
+            model = (model or "").strip()
+            if len(model) > 255 or any(c.isspace() for c in model):
+                raise HTTPException(status_code=400, detail="model must be a single name of at most 255 characters")
+            if model:
+                try:
+                    import litellm
+                    from shared.utils.tools.image_tools import resolve_image_model
+                    litellm.get_llm_provider(resolve_image_model(model)[0])
+                except Exception:
+                    raise HTTPException(status_code=400,
+                                        detail=f"Unknown model '{model}': write it as provider/model, e.g. gemini/gemini-2.5-flash-image")
+            before = get_setting(IMAGE_MODEL) or ""
+            if not set_setting(IMAGE_MODEL, model, username):
+                raise HTTPException(status_code=500, detail="Could not store the setting")
+            try:
+                from shared.utils.audit_service import ACTION_CONFIG_CHANGE, log
+                log(username, ACTION_CONFIG_CHANGE, "setting", resource_id=IMAGE_MODEL,
+                    details={"before": before or None, "after": model or None}, request=request)
+            except Exception as e:
+                logger.debug("Audit log for image model setting: %s", e)
+            return _image_model_state()
+
+        # ── Model prices (cost in US dollars, see shared/utils/model_pricing.py) ──
+
+        def _with_session(work):
+            session = self.db_client.get_session() if self.db_client else None
+            if session is None:
+                raise HTTPException(status_code=503, detail="Database unavailable")
+            try:
+                return work(session)
+            finally:
+                session.close()
+
+        def _price_rows(session) -> Dict[str, Any]:
+            from shared.utils.model_pricing import model_price_rows
+            return {"models": model_price_rows(session)}
+
+        def _reprice(session, model_name: str) -> None:
+            from shared.utils.model_pricing import forget_manual_prices, recompute_costs
+            forget_manual_prices()
+            recompute_costs(session, model_name=model_name, only_missing=False)
+
+        def _audit_price(username: str, request: Request, model_name: str, before, after) -> None:
+            try:
+                from shared.utils.audit_service import ACTION_CONFIG_CHANGE, log
+                log(username, ACTION_CONFIG_CHANGE, "model_price", resource_id=model_name,
+                    details={"before": before, "after": after}, request=request)
+            except Exception as e:
+                logger.debug("Audit log for model price: %s", e)
+
+        @self.app.get("/dashboard/api/settings/model-prices", tags=["Dashboard - Settings"])
+        async def get_model_prices(request: Request, username: str = Depends(self._get_auth_user_dependency)):
+            """Every model used or priced by hand: its price per million tokens, where it comes from, and calls without a cost."""
+            if not self._get_is_admin(request):
+                raise HTTPException(status_code=403, detail="Forbidden")
+            from starlette.concurrency import run_in_threadpool
+            return await run_in_threadpool(_with_session, _price_rows)
+
+        @self.app.put("/dashboard/api/settings/model-prices", tags=["Dashboard - Settings"])
+        async def put_model_price(request: Request, username: str = Depends(self._get_auth_user_dependency),
+                                  body: Dict[str, Any] = Body(...)):
+            """Set a model's price by hand, in US dollars per million tokens, and price all its calls with it."""
+            if not self._get_is_admin(request):
+                raise HTTPException(status_code=403, detail="Forbidden")
+            import math
+            model_name = body.get("model_name")
+            if not isinstance(model_name, str) or not model_name.strip() or len(model_name.strip()) > 255 \
+                    or any(c.isspace() for c in model_name.strip()):
+                raise HTTPException(status_code=400, detail="model_name must be a single name of at most 255 characters")
+            model_name = model_name.strip()
+            prices = {}
+            for key in ("input_usd_per_mtok", "output_usd_per_mtok"):
+                value = body.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(value) or not 0 <= value <= 100000:
+                    raise HTTPException(status_code=400, detail=f"{key} must be a number from 0 to 100000")
+                prices[key] = float(value)
+
+            def work(session):
+                from shared.utils.models import ModelPrice
+                row = session.get(ModelPrice, model_name)
+                before = ({"input_usd_per_mtok": row.input_usd_per_mtok,
+                           "output_usd_per_mtok": row.output_usd_per_mtok} if row else None)
+                if row is None:
+                    row = ModelPrice(model_name=model_name)
+                    session.add(row)
+                row.input_usd_per_mtok = prices["input_usd_per_mtok"]
+                row.output_usd_per_mtok = prices["output_usd_per_mtok"]
+                row.updated_by = username
+                session.commit()
+                _reprice(session, model_name)
+                _audit_price(username, request, model_name, before, prices)
+                return _price_rows(session)
+
+            from starlette.concurrency import run_in_threadpool
+            return await run_in_threadpool(_with_session, work)
+
+        @self.app.delete("/dashboard/api/settings/model-prices", tags=["Dashboard - Settings"])
+        async def delete_model_price(request: Request, model: str = Query(...),
+                                     username: str = Depends(self._get_auth_user_dependency)):
+            """Remove a manual price: the model's calls are priced from the published lists again, or have no cost."""
+            if not self._get_is_admin(request):
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+            def work(session):
+                from shared.utils.models import ModelPrice
+                row = session.get(ModelPrice, model)
+                if row is None:
+                    raise HTTPException(status_code=404, detail="No manual price for this model")
+                before = {"input_usd_per_mtok": row.input_usd_per_mtok,
+                          "output_usd_per_mtok": row.output_usd_per_mtok}
+                session.delete(row)
+                session.commit()
+                _reprice(session, model)
+                _audit_price(username, request, model, before, None)
+                return _price_rows(session)
+
+            from starlette.concurrency import run_in_threadpool
+            return await run_in_threadpool(_with_session, work)
+
+        @self.app.post("/dashboard/api/settings/model-prices/fill-missing", tags=["Dashboard - Settings"])
+        async def fill_missing_costs(request: Request, username: str = Depends(self._get_auth_user_dependency)):
+            """Price the calls logged without a cost whose model has a price now."""
+            if not self._get_is_admin(request):
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+            def work(session):
+                from shared.utils.model_pricing import recompute_costs
+                priced = recompute_costs(session, only_missing=True)
+                return {"priced": priced, **_price_rows(session)}
+
+            from starlette.concurrency import run_in_threadpool
+            return await run_in_threadpool(_with_session, work)
+
         def _validate_alert_rule(body: dict, partial: bool = False) -> dict:
             """Shared validation for create and update. Raises HTTPException on bad input."""
             from shared.utils.alert_service import CONDITION_TYPES, DESTINATION_TYPES, SCOPES
@@ -7279,13 +7716,27 @@ class DashboardServer:
 
             destination_config = body.get("destination_config")
             if destination_config is not None:
-                if destination_type == 'http' and not (destination_config.get("url") or "").strip():
-                    raise HTTPException(status_code=400, detail="destination_config.url is required for http")
+                if destination_type in ('http', 'slack', 'discord') and not (destination_config.get("url") or "").strip():
+                    raise HTTPException(status_code=400,
+                                        detail=f"destination_config.url is required for {destination_type}")
                 if destination_type == 'email' and not (destination_config.get("to") or "").strip():
                     raise HTTPException(status_code=400, detail="destination_config.to is required for email")
                 fields["destination_config"] = destination_config
             if body.get("condition_config") is not None:
-                fields["condition_config"] = body.get("condition_config")
+                config = body.get("condition_config")
+                if isinstance(config, dict) and config.get("unit", "tokens") not in ("tokens", "usd"):
+                    raise HTTPException(status_code=400, detail="unit must be tokens or usd")
+                if isinstance(config, dict) and config.get("unit") == "usd":
+                    import math
+                    from shared.utils.alert_service import USD_PERIODS
+                    if config.get("period", "day") not in USD_PERIODS:
+                        raise HTTPException(status_code=400,
+                                            detail="A budget in dollars is per day or per month")
+                    limit = config.get("usd_limit")
+                    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, (int, float))
+                                              or not math.isfinite(limit) or limit <= 0):
+                        raise HTTPException(status_code=400, detail="usd_limit must be a number of dollars above 0")
+                fields["condition_config"] = config
             for key in ("cooldown_seconds",):
                 if key in body and body[key] is not None:
                     fields[key] = int(body[key])

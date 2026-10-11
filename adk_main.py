@@ -14,6 +14,7 @@ from shared.utils.db_memory_service import DBMemoryService
 from google.adk.sessions.database_session_service import DatabaseSessionService
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from shared.utils.utils import adk_dev_ui_enabled, fix_session_events_compaction
+from shared.utils import settings
 import uvicorn
 import argparse
 from shared.utils.db_credential_service import DBCredentialService
@@ -115,7 +116,7 @@ def register_custom_services():
         return SupabaseArtifactService(
             url=kwargs_copy.pop("url", os.getenv("SUPABASE_URL")),
             key=kwargs_copy.pop("key", os.getenv("SUPABASE_KEY")),
-            bucket_name=kwargs_copy.pop("bucket_name", os.getenv("SUPABASE_BUCKET", "artifacts")),
+            bucket_name=kwargs_copy.pop("bucket_name", settings.supabase_bucket()),
             **kwargs_copy
         )
     
@@ -185,19 +186,21 @@ agent_loader = AgentLoader(AGENT_DIR)
 adk_web_server = None
 
 # Initialize services using service registry
-ARTIFACT_SERVICE_TYPE = os.getenv("ARTIFACT_SERVICE", "none").lower()
+ARTIFACT_SERVICE_TYPE = settings.artifact_service()
 MEMORY_SERVICE_TYPE = os.getenv("MEMORY_SERVICE", "database").lower()
 CREDENTIAL_SERVICE_TYPE = os.getenv("CREDENTIAL_SERVICE", "database").lower()
 
-print(f"ARTIFACT_SERVICE environment variable: {os.getenv('ARTIFACT_SERVICE', 'not set')}")
-print(f"MEMORY_SERVICE environment variable: {os.getenv('MEMORY_SERVICE', 'not set')}")
-print(f"CREDENTIAL_SERVICE environment variable: {os.getenv('CREDENTIAL_SERVICE', 'not set')}")
 print(f"Using artifact service type: {ARTIFACT_SERVICE_TYPE}")
 print(f"Using memory service type: {MEMORY_SERVICE_TYPE}")
 print(f"Using credential service type: {CREDENTIAL_SERVICE_TYPE}")
 
 # Get service registry
 registry = get_service_registry()
+
+# The application's MySQL URL names the sync driver (mysql+pymysql://); the
+# "mysql" factory switches it to the async one
+if SESSION_DB_URL.startswith("mysql+pymysql://"):
+    SESSION_DB_URL = "mysql://" + SESSION_DB_URL[len("mysql+pymysql://"):]
 
 # Initialize session service using registry
 if SESSION_DB_URL.startswith("sqlite://"):
@@ -207,8 +210,9 @@ elif SESSION_DB_URL.startswith("postgresql://"):
 elif SESSION_DB_URL.startswith("mysql://"):
     session_service = registry.create_session_service(SESSION_DB_URL)
 else:
-    # Default to in-memory for unsupported URLs
-    session_service = registry.create_session_service("in_memory://")
+    # Default to in-memory for unsupported URLs. Not through the registry:
+    # "in_memory" is not a valid URL scheme, so it would return None.
+    session_service = InMemorySessionService()
 
 # Initialize artifact service using registry
 if ARTIFACT_SERVICE_TYPE == "local_folder":
@@ -230,7 +234,7 @@ elif ARTIFACT_SERVICE_TYPE == "supabase":
         "supabase://test-project",
         url=os.getenv("SUPABASE_URL"),
         key=os.getenv("SUPABASE_KEY"),
-        bucket_name=os.getenv("SUPABASE_BUCKET", "artifacts")
+        bucket_name=settings.supabase_bucket()
     )
 else:
     # Default to InMemoryArtifactService if "none" or not set
