@@ -1062,6 +1062,8 @@ class DashboardServer:
             def _parse_attrs(attrs):
                 if not attrs:
                     return {}
+                if isinstance(attrs, dict):  # PostgreSQL's driver returns JSONB already parsed
+                    return attrs
                 try:
                     return json.loads(attrs)
                 except (json.JSONDecodeError, TypeError):
@@ -1111,6 +1113,114 @@ class DashboardServer:
         except Exception as e:
             logger.warning("Error getting traces (trace_spans table may not exist): %s", e)
             return {"traces": [], "error": str(e)}
+        finally:
+            session.close()
+
+    # Session ids are generated (uuids); anything else is refused before it reaches LIKE.
+    _REPLAY_SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+    @staticmethod
+    def _span_attributes_as_text(session) -> str:
+        """SQL for trace_spans.attributes as text: JSONB on PostgreSQL and JSON on MySQL take no LIKE."""
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            return "CAST(attributes AS TEXT)"
+        if dialect == "mysql":
+            return "CAST(attributes AS CHAR)"
+        return "attributes"
+
+    def _replay_spans(self, session, where: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Spans matching `where`, as the dicts shared.utils.tracing.replay works on.
+
+        `where` is a fixed SQL fragment from this class; `{attributes_text}` in it is
+        replaced with the attributes column as text. Values only go in as bind params.
+        """
+        from sqlalchemy import text, bindparam
+        where = where.format(attributes_text=self._span_attributes_as_text(session))
+        query = text(
+            "SELECT trace_id, span_id, parent_span_id, name, start_time, end_time, attributes, status, error_message "
+            f"FROM trace_spans WHERE {where}"
+        )
+        if "tids" in params:
+            query = query.bindparams(bindparam("tids", expanding=True))
+        spans = []
+        for tid, sid, pid, name, st, et, attrs, status, err in session.execute(query, params).fetchall():
+            # PostgreSQL's driver returns JSONB already parsed; SQLite returns text
+            try:
+                parsed = attrs if isinstance(attrs, dict) else (json.loads(attrs) if attrs else {})
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+            spans.append({
+                "trace_id": tid, "span_id": sid, "parent_span_id": pid, "name": name,
+                "start_time": st, "end_time": et, "attributes": parsed if isinstance(parsed, dict) else {},
+                "status": status, "error_message": err,
+            })
+        return spans
+
+    def _list_replay_sessions(self, hours: int = 24, limit: int = 50) -> Dict[str, Any]:
+        """Sessions with traced turns in the last `hours`, most recent first."""
+        from datetime import timedelta
+        from shared.utils.tracing.replay import AGENT_ATTRS, session_of, to_datetime
+        session = self.db_client.get_session() if self.db_client else None
+        if not session:
+            return {"sessions": [], "error": "Database connection failed"}
+        try:
+            spans = self._replay_spans(
+                session, "start_time >= :threshold AND {attributes_text} LIKE :pat",
+                {"threshold": datetime.now() - timedelta(hours=hours), "pat": "%gen_ai.conversation.id%"},
+            )
+            found: Dict[str, Dict[str, Any]] = {}
+            for s in spans:
+                sid = session_of(s)
+                if not sid:
+                    continue
+                entry = found.setdefault(sid, {"session_id": sid, "traces": set(), "agents": set(), "last": None})
+                entry["traces"].add(s["trace_id"])
+                for key in AGENT_ATTRS:
+                    if s["attributes"].get(key):
+                        entry["agents"].add(str(s["attributes"][key]))
+                st = to_datetime(s["start_time"])
+                if st and (entry["last"] is None or st > entry["last"]):
+                    entry["last"] = st
+            ordered = sorted(found.values(), key=lambda e: e["last"].timestamp() if e["last"] else 0,
+                             reverse=True)[:limit]
+            return {"sessions": [{
+                "session_id": e["session_id"],
+                "turns": len(e["traces"]),
+                "agents": sorted(e["agents"]),
+                "last_activity": e["last"].isoformat() if e["last"] else None,
+            } for e in ordered]}
+        except Exception as e:
+            logger.warning("Error listing replay sessions (trace_spans table may not exist): %s", e)
+            return {"sessions": [], "error": "Could not read traces; see the server log"}
+        finally:
+            session.close()
+
+    def _get_session_replay(self, session_id: str, hours: int = 168) -> Dict[str, Any]:
+        """Every traced turn of one session, built into a replay timeline."""
+        from datetime import timedelta
+        from shared.utils.tracing.replay import build_replay, session_of
+        if not self._REPLAY_SESSION_ID.match(session_id or ""):
+            raise HTTPException(status_code=400, detail="Invalid session id")
+        session = self.db_client.get_session() if self.db_client else None
+        if not session:
+            return {"session_id": session_id, "turns": [], "error": "Database connection failed"}
+        try:
+            # LIKE narrows the scan; the exact match is checked on the parsed attributes.
+            candidates = self._replay_spans(
+                session, "start_time >= :threshold AND {attributes_text} LIKE :pat",
+                {"threshold": datetime.now() - timedelta(hours=hours), "pat": f"%{session_id}%"},
+            )
+            trace_ids = sorted({s["trace_id"] for s in candidates if session_of(s) == session_id})
+            if not trace_ids:
+                return {"session_id": session_id, "turns": []}
+            spans = self._replay_spans(session, "trace_id IN :tids", {"tids": trace_ids})
+            return build_replay(session_id, spans)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("Error building session replay: %s", e)
+            return {"session_id": session_id, "turns": [], "error": "Could not read traces; see the server log"}
         finally:
             session.close()
 
@@ -3898,6 +4008,26 @@ class DashboardServer:
         ):
             """Get traces from trace_spans table for dashboard viewer."""
             return self._get_traces(hours, limit, trace_id)
+
+        @self.app.get("/dashboard/api/traces/sessions", tags=["Dashboard - Traces"])
+        async def get_replay_sessions_api(
+            request: Request,
+            username: str = Depends(self._get_auth_user_dependency),
+            hours: int = Query(24, ge=1, le=24 * 30),
+            limit: int = Query(50, ge=1, le=200),
+        ):
+            """Sessions with traced turns, for the Visual Builder's replay picker."""
+            return self._list_replay_sessions(hours, limit)
+
+        @self.app.get("/dashboard/api/traces/replay", tags=["Dashboard - Traces"])
+        async def get_session_replay_api(
+            request: Request,
+            session_id: str,
+            username: str = Depends(self._get_auth_user_dependency),
+            hours: int = Query(168, ge=1, le=24 * 90),
+        ):
+            """One session's traced turns as replay timelines: agents, model calls, tools, fallbacks."""
+            return self._get_session_replay(session_id, hours)
 
         @self.app.get("/dashboard/api/users", tags=["Dashboard - Users"])
         async def get_users(request: Request, username: str = Depends(self._get_auth_user_dependency)):

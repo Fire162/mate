@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Trace Replay on the Visual Builder canvas** - a traced chat turn can be played back on the agent graph: agents light up in the order they ran, each shows the model or tool it is using and how long it has run, finished agents show their time, and an agent whose model failed shows which fallback model answered. Open it with **Replay** in the Visual Builder toolbar, or **Replay on canvas** on a trace. It reads the `trace_spans` rows recorded with `OTEL_TRACING_ENABLED=true` (ADK runtime only), through two new admin routes, `GET /dashboard/api/traces/sessions` and `GET /dashboard/api/traces/replay`. The `gen_ai.inference` span now records `mate.model.fallback` and the fallback as `gen_ai.response.model` when the fallback answered. See `docs/user/trace-replay.md`
 - **Docker image on GitHub Container Registry** (#249) - every release tag now publishes `ghcr.io/antiv/mate` for `linux/amd64` and `linux/arm64`, tagged `1.5.0`, `1.5` and `latest`, so MATE runs with one `docker run` and no clone or local build. The workflow starts the image and checks `/health` before it pushes anything. See `docs/dev/deployment.md`
 - **Agent MCP servers offer a prompt and a resource** - next to its tool, each agent exposed over MCP now lists the prompt `ask_<agent>`, which asks the agent a question through its tool, and the resource `mate://agents/<agent>/about`, with the agent's name, description and how to call it (not its instruction). `initialize` announces both capabilities. See `docs/dev/mcp-servers.md`
 - **`GET /mcp` lists the agents exposed over MCP** (#231) - with a personal access token (or any other way the agent servers accept), it returns the agents in `MCP_EXPOSED_AGENTS` that the caller may use, each with its name, description and full MCP URL, so a client can be set up without knowing the names. See `docs/dev/mcp-servers.md`
@@ -31,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Traces showed no span attributes on PostgreSQL** - `trace_spans.attributes` is `JSONB` there, which the driver returns already parsed, and the Traces page only parsed text, so every span showed none. It now takes both
 - **A2A was off on the pinned a2a-sdk 1.2.1** (#223) - `adk_main.py` was written for a2a-sdk 0.3, whose `a2a.server.apps` no longer exists in 1.x. Starting with `--a2a`, which the dashboard always does, printed "A2A dependencies not available" and mounted no `/a2a/*` routes, so A2A calls failed, and so did agents exposed over MCP, which go through A2A.
   - **The fix:** the routes are now built through ADK's `google.adk.a2a._compat` (`shared/utils/a2a_routes.py`), which works on 0.3 and 1.x.
   - **Method names:** `/a2a/{agent}` accepts the 1.x methods (`SendMessage`, `GetTask`, ...) and the 0.3 ones (`message/send`, `tasks/get`, ...).
