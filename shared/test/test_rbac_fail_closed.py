@@ -86,6 +86,77 @@ class TestAdkCallback(_Db):
         self.assertEqual(response.error_code, "RBAC_ACCESS_DENIED")
 
 
+class TestMissingContextDenies(_Db):
+    """The callback used to let a model call through when it could not tell who was
+    asking, which agent it was, or find the agent's config (also when the lookup
+    failed). None of these grants access now."""
+
+    def _call(self, context, manager):
+        from shared.callbacks import rbac_callback
+        users = self._user_service()
+        with patch.object(rbac_callback, "get_user_service", return_value=users), \
+                patch("shared.utils.agent_manager.get_agent_manager", return_value=manager), \
+                patch.object(rbac_callback, "_log_access_denied_event"):
+            return rbac_callback.rbac_before_model_callback(context, MagicMock())
+
+    def _manager(self, row=None):
+        manager = MagicMock()
+        manager.get_root_agent_by_name.return_value = row
+        manager.get_session.return_value = None
+        return manager
+
+    def assertDenied(self, response):
+        self.assertIsNotNone(response)
+        self.assertEqual(response.error_code, "RBAC_ACCESS_DENIED")
+
+    def test_no_user_id_is_denied(self):
+        context = SimpleNamespace(_invocation_context=SimpleNamespace(user_id=None),
+                                  agent_name="user_bot")
+        self.assertDenied(self._call(context, self._manager()))
+
+    def test_no_agent_name_is_denied(self):
+        context = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="u"),
+                                  agent_name=None, agent=None)
+        self.assertDenied(self._call(context, self._manager()))
+
+    def test_an_agent_without_a_config_is_denied(self):
+        # get_root_agent_by_name returns None for a missing or disabled row, and also
+        # when the query raised, so this covers a database error too
+        context = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="u"),
+                                  agent_name="gone_bot")
+        self.assertDenied(self._call(context, self._manager(row=None)))
+
+    def test_skipped_agents_still_run_without_a_config(self):
+        # Refusing on a missing config must not catch what the check skips
+        from shared.utils import eval_agent_runner
+        system = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="u"),
+                                 agent_name="mate_fallback_agent")
+        self.assertIsNone(self._call(system, self._manager(row=None)))
+        token = eval_agent_runner._EVAL_RUN.set(True)
+        try:
+            evaluated = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="eval_runner"),
+                                        agent_name="snapshot_bot")
+            self.assertIsNone(self._call(evaluated, self._manager(row=None)))
+        finally:
+            eval_agent_runner._EVAL_RUN.reset(token)
+
+
+class TestCallbackChain(unittest.TestCase):
+
+    def test_a_check_that_fails_to_run_denies(self):
+        from shared.callbacks import user_profile_callback
+        context = SimpleNamespace(agent_name="some_bot")
+        with patch("shared.callbacks.token_usage_callback.capture_model_name_callback"), \
+                patch.object(user_profile_callback, "user_profile_context_callback"), \
+                patch("shared.callbacks.rbac_callback.rbac_before_model_callback",
+                      side_effect=RuntimeError("broken")), \
+                patch("shared.callbacks.guardrail_callback.guardrail_before_model_callback",
+                      return_value=None):
+            response = user_profile_callback.combined_user_profile_and_rbac_callback(context, MagicMock())
+        self.assertIsNotNone(response)
+        self.assertEqual(response.error_code, "RBAC_ACCESS_DENIED")
+
+
 class TestLangGraphHook(unittest.TestCase):
 
     def test_an_error_during_the_check_denies(self):
@@ -94,6 +165,17 @@ class TestLangGraphHook(unittest.TestCase):
             event = hooks.check_rbac("u", "some_bot")
         self.assertIsNotNone(event)
         self.assertIn("Access Denied", str(event))
+
+    def test_an_agent_without_a_config_is_denied(self):
+        from shared.utils.langgraph import hooks
+        user = MagicMock()
+        user.get_roles.return_value = ["user"]
+        with patch("shared.utils.user_service.get_user_service") as users, \
+                patch.object(hooks, "_load_agent_config_row", return_value=None):
+            users.return_value.get_or_create_user.return_value = user
+            event = hooks.check_rbac("u", "gone_bot")
+        self.assertIsNotNone(event)
+        self.assertEqual(event["error_code"], "RBAC_ACCESS_DENIED")
 
 
 if __name__ == "__main__":
