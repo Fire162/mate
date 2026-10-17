@@ -317,7 +317,6 @@ function syncJsonToToolConfig(prefix = '') {
  * Setup event listeners for tool configuration
  */
 function setupToolListeners(prefix) {
-    console.log('setupToolListeners called with prefix:', prefix);
     
     // Find the parent container that holds all tool checkboxes
     // Look for the first tool checkbox to find its parent container
@@ -338,7 +337,6 @@ function setupToolListeners(prefix) {
     }
     
     if (parentContainer) {
-        console.log('Using event delegation on parent container');
         // Use event delegation - listen for change events on the parent
         parentContainer.addEventListener('change', function(e) {
             const target = e.target;

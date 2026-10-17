@@ -618,10 +618,8 @@ function initializeConfigSummaryHandling(prefixes) {
  * Edit agent by ID
  */
 function editAgentById(id) {
-    console.log('editAgentById called with ID:', id, 'Type:', typeof id);
     const config = findConfigById(id);
     if (config) {
-        console.log('Found config:', { id: config.id, name: config.name, idType: typeof config.id });
         editAgent(config);
     } else {
         const availableIds = typeof configs !== 'undefined' 
@@ -713,7 +711,6 @@ function editAgent(config) {
     
     // Populate basic fields - use parsed ID to ensure it's normalized
     document.getElementById('editAgentId').value = parsedId;
-    console.log('Setting editAgentId to:', parsedId, 'from raw:', rawId, 'type:', typeof rawId);
     document.getElementById('editAgentName').value = config.name;
     document.getElementById('editAgentType').value = config.type;
     document.getElementById('editAgentModel').value = config.model_name || '';
@@ -1034,7 +1031,6 @@ function handleImportFile() {
     reader.onload = function(e) {
         try {
             const agents = JSON.parse(e.target.result);
-            console.log('Parsed agents:', agents);
             // The actual import will be handled by form submission
         } catch (error) {
             showAlert('Invalid JSON file', 'error');
