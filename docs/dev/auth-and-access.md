@@ -131,7 +131,9 @@ a lookup that failed. An error during the check refuses too.
   without a config the same way. Its `/run_sse` already rejects a request without a
   user id or app name.
 - Eval and Playground runs skip the check (`is_eval_run`), since an admin started
-  them, and so do the system agents in `_should_skip_rbac_check`.
+  them. So does the fallback agent that reports a configuration that could not load
+  (`shared/utils/fallback_agent.py`). It is recognised by its own class, which the
+  copy ADK runs keeps, not by its name, which any `agents_config` row can take.
 - Agents built in code, outside `agents_config`, get the per-agent callbacks only if
   they attach them. With `MATE_PLUGINS_ENABLED=true` the check runs for every LLM
   agent in the app, so such an agent needs an `agents_config` row, or it is refused.

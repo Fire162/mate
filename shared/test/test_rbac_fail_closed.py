@@ -129,8 +129,9 @@ class TestMissingContextDenies(_Db):
     def test_skipped_agents_still_run_without_a_config(self):
         # Refusing on a missing config must not catch what the check skips
         from shared.utils import eval_agent_runner
-        system = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="u"),
-                                 agent_name="mate_fallback_agent")
+        fallback = _fallback_agent()
+        system = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="u", agent=fallback),
+                                 agent_name=fallback.name)
         self.assertIsNone(self._call(system, self._manager(row=None)))
         token = eval_agent_runner._EVAL_RUN.set(True)
         try:
@@ -139,6 +140,95 @@ class TestMissingContextDenies(_Db):
             self.assertIsNone(self._call(evaluated, self._manager(row=None)))
         finally:
             eval_agent_runner._EVAL_RUN.reset(token)
+
+
+def _fallback_agent():
+    from shared.utils import fallback_agent
+    with patch.object(fallback_agent, "create_model", return_value="gemini-2.5-flash"):
+        return fallback_agent.create_fallback_agent()
+
+
+class TestSkipIsByClass(_Db):
+    """The check skipped any agent named mate_fallback_agent, system_agent or
+    health_check_agent, so an agents_config row given one of those names (the
+    dashboard and the create_agent tool accept any name) ran with no role check.
+    Only the agent create_fallback_agent built is skipped now."""
+
+    def _run(self, agent_obj, name, row):
+        from shared.callbacks import rbac_callback
+        from shared.utils.rbac_middleware import RBACMiddleware
+        users = self._user_service()
+        with patch("shared.utils.rbac_middleware.get_user_service", return_value=users):
+            middleware = RBACMiddleware()
+        manager = MagicMock()
+        manager.get_root_agent_by_name.return_value = row
+        context = SimpleNamespace(_invocation_context=SimpleNamespace(user_id="plain_user", agent=agent_obj),
+                                  agent_name=name)
+        with patch.object(rbac_callback, "get_user_service", return_value=users), \
+                patch.object(rbac_callback, "get_rbac_middleware", return_value=middleware), \
+                patch("shared.utils.agent_manager.get_agent_manager", return_value=manager), \
+                patch.object(rbac_callback, "_log_access_denied_event"):
+            return rbac_callback.rbac_before_model_callback(context, MagicMock())
+
+    def test_a_configured_agent_with_a_reserved_name_is_checked(self):
+        for name in ("mate_fallback_agent", "system_agent", "health_check_agent"):
+            admin_only = AgentConfig(name=name, allowed_for_roles=None)
+            response = self._run(SimpleNamespace(name=name), name, admin_only)
+            self.assertIsNotNone(response, name)
+            self.assertEqual(response.error_code, "RBAC_ACCESS_DENIED")
+
+    def test_the_fallback_agent_is_skipped(self):
+        fallback = _fallback_agent()
+        self.assertIsNone(self._run(fallback, fallback.name, None))
+        # ADK runs a copy of the root agent, not the object create_fallback_agent returned
+        copy = fallback.clone()
+        self.assertIsNot(copy, fallback)
+        self.assertIsNone(self._run(copy, copy.name, None))
+
+
+class TestFallbackUnderARunner(unittest.TestCase):
+    """What the check sees when ADK actually runs the fallback agent: the agent in
+    the invocation context of a plugin's before_model_callback, as with
+    MATE_PLUGINS_ENABLED=true."""
+
+    def test_the_running_fallback_agent_is_recognised(self):
+        import asyncio
+        from typing import AsyncGenerator
+        from google.adk.apps import App
+        from google.adk.models.base_llm import BaseLlm
+        from google.adk.models.llm_request import LlmRequest
+        from google.adk.models.llm_response import LlmResponse
+        from google.adk.plugins.base_plugin import BasePlugin
+        from google.adk.runners import InMemoryRunner
+        from google.genai import types
+        from shared.utils import fallback_agent
+
+        class Reply(BaseLlm):
+            model: str = "reply"
+
+            async def generate_content_async(self, llm_request: LlmRequest,
+                                             stream: bool = False) -> AsyncGenerator[LlmResponse, None]:
+                yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="ok")]))
+
+        seen = []
+
+        class Watch(BasePlugin):
+            async def before_model_callback(self, *, callback_context, llm_request):
+                seen.append(fallback_agent.is_fallback_agent(callback_context._invocation_context.agent))
+                return None
+
+        with patch.object(fallback_agent, "create_model", return_value=Reply()):
+            agent = fallback_agent.create_fallback_agent()
+        runner = InMemoryRunner(app=App(name="fallback_app", root_agent=agent, plugins=[Watch(name="watch")]))
+
+        async def run():
+            session = await runner.session_service.create_session(app_name="fallback_app", user_id="u")
+            message = types.Content(role="user", parts=[types.Part(text="hi")])
+            async for _ in runner.run_async(user_id="u", session_id=session.id, new_message=message):
+                pass
+
+        asyncio.run(run())
+        self.assertEqual(seen, [True])
 
 
 class TestCallbackChain(unittest.TestCase):
